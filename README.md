@@ -1,31 +1,49 @@
-# 自動化プログラム（ファイルバックアップ）
+# 自動化プログラム（実用版バックアップ）
 
-このプログラムは、指定したフォルダ内のファイルを
-**拡張子で絞り込んで**、**日時付きフォルダ**に自動コピーします。
+このツールは、指定フォルダを **実運用しやすい形で** バックアップするための CLI です。
 
-## できること
+## 実用向けに強化したポイント
 
-- `.txt` や `.csv` など、対象拡張子を指定できる
-- サブフォルダも含めてまとめて探索する
-- バックアップ先を `YYYYMMDD_HHMMSS` で分けて保存する
-- `--dry-run` で「実際にはコピーせず確認だけ」できる
+- 拡張子フィルタ（`--ext`）
+- 除外パターン（`--exclude`）
+- ドライラン（`--dry-run`）
+- 古い世代の自動削除（`--keep`）
+- 実行結果サマリー表示（探索/コピー/スキップ/削除件数）
 
-## 実行例
-
-### 1) 引数で直接指定する
+## 基本コマンド
 
 ```bash
-python automation.py --source ./data --dest ./backup --ext .txt .csv .log
+python automation.py --source ./data --dest ./backup --ext .txt .csv --exclude '*.tmp' --keep 14
 ```
 
-### 2) ドライラン（コピーしない）
+## まずは安全確認（ドライラン）
 
 ```bash
 python automation.py --source ./data --dest ./backup --dry-run
 ```
 
-### 3) 設定ファイルを使う
+## 設定ファイルで実行
 
 ```bash
 python automation.py --config backup_config.example.json
 ```
+
+## 設定ファイル例
+
+`backup_config.example.json`:
+
+```json
+{
+  "source": "./data",
+  "dest": "./backup",
+  "ext": [".txt", ".csv", ".log"],
+  "exclude": ["*.tmp", "cache/*"],
+  "keep": 7
+}
+```
+
+## 運用のコツ
+
+- まず `--dry-run` で対象確認
+- 問題なければ cron / タスクスケジューラで定期実行
+- `--keep` を小さくしすぎると復元候補が減るため注意

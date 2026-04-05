@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""フォルダ内ファイルを自動バックアップするスクリプト。
+"""実用向けのファイルバックアップ自動化ツール。
 
-使い方:
+主な用途:
+- 拡張子・除外パターンで対象を絞った定期バックアップ
+- 実行前の dry-run 確認
+- 古いバックアップの世代管理
+
+使い方例:
   python automation.py --source ./data --dest ./backup --ext .txt .csv
   python automation.py --config backup_config.example.json --dry-run
 """
@@ -10,9 +15,34 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import json
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
+
+TIMESTAMP_FMT = "%Y%m%d_%H%M%S"
+
+
+@dataclass
+class Settings:
+    """実行時に使う設定値。"""
+
+    source: Path
+    dest: Path
+    ext: list[str]
+    exclude: list[str]
+    keep: int
+    dry_run: bool
+
+
+@dataclass
+class BackupResult:
+    """バックアップ実行結果。"""
+
+    scanned: int = 0
+    copied: int = 0
+    skipped: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,9 +56,16 @@ def parse_args() -> argparse.Namespace:
         "--ext",
         nargs="*",
         default=[".txt", ".csv"],
-        help="対象拡張子（例: .txt .csv）",
+        help="対象拡張子（例: .txt .csv）。空にすると全ファイル対象",
     )
-    parser.add_argument("--config", type=Path, help="JSON設定ファイル（source / dest / ext）")
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[],
+        help="除外する glob パターン（例: '*.tmp' '.git/*'）",
+    )
+    parser.add_argument("--keep", type=int, default=7, help="保持するバックアップ世代数（既定: 7）")
+    parser.add_argument("--config", type=Path, help="JSON設定ファイル")
     parser.add_argument("--dry-run", action="store_true", help="コピーはせず、予定だけ表示")
     return parser.parse_args()
 
@@ -38,7 +75,6 @@ def load_config(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 最低限必要なキーがあるか確認
     required = {"source", "dest"}
     missing = required - set(data)
     if missing:
@@ -46,67 +82,160 @@ def load_config(path: Path) -> dict:
     return data
 
 
-def resolve_settings(args: argparse.Namespace) -> tuple[Path, Path, list[str]]:
-    """引数または設定ファイルから実行設定を決定する。"""
+def normalize_extensions(ext_list: list[str]) -> list[str]:
+    """拡張子を正規化（小文字 + 先頭ドット）する。"""
+    normalized = []
+    for ext in ext_list:
+        fixed = ext if ext.startswith(".") else f".{ext}"
+        normalized.append(fixed.lower())
+    return normalized
+
+
+def resolve_settings(args: argparse.Namespace) -> Settings:
+    """引数または設定ファイルから最終設定を組み立てる。"""
     if args.config:
         cfg = load_config(args.config)
         source = Path(cfg["source"])
         dest = Path(cfg["dest"])
         ext = cfg.get("ext", args.ext)
+        exclude = cfg.get("exclude", args.exclude)
+        keep = int(cfg.get("keep", args.keep))
     else:
         if not args.source or not args.dest:
             raise ValueError("--source と --dest を指定するか、--config を使用してください")
         source = args.source
         dest = args.dest
         ext = args.ext
+        exclude = args.exclude
+        keep = args.keep
 
-    # txt のようにドットなし指定でも .txt に補正する
-    ext = [e if e.startswith(".") else f".{e}" for e in ext]
-    return source, dest, ext
+    if keep < 1:
+        raise ValueError("--keep は 1 以上を指定してください")
+
+    normalized_ext = normalize_extensions(ext) if ext else []
+    return Settings(
+        source=source,
+        dest=dest,
+        ext=normalized_ext,
+        exclude=exclude,
+        keep=keep,
+        dry_run=args.dry_run,
+    )
 
 
-def collect_files(source: Path, extensions: list[str]) -> list[Path]:
-    """対象拡張子のファイルを再帰的に集める。"""
-    return [p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in extensions]
+def should_exclude(relative_path: Path, patterns: list[str]) -> bool:
+    """相対パスが除外パターンに一致するか判定する。"""
+    path_text = relative_path.as_posix()
+    return any(fnmatch.fnmatch(path_text, pat) for pat in patterns)
 
 
-def backup_files(files: list[Path], source: Path, dest: Path, dry_run: bool) -> int:
+def collect_files(settings: Settings) -> list[Path]:
+    """設定に合うファイルを再帰的に収集する。"""
+    files: list[Path] = []
+    for p in settings.source.rglob("*"):
+        if not p.is_file():
+            continue
+
+        rel = p.relative_to(settings.source)
+        if should_exclude(rel, settings.exclude):
+            continue
+
+        if settings.ext and p.suffix.lower() not in settings.ext:
+            continue
+
+        files.append(p)
+    return files
+
+
+def is_same_file(src: Path, dst: Path) -> bool:
+    """サイズと更新時刻で同一ファイルか簡易判定する。"""
+    if not dst.exists():
+        return False
+    src_stat = src.stat()
+    dst_stat = dst.stat()
+    return src_stat.st_size == dst_stat.st_size and int(src_stat.st_mtime) == int(dst_stat.st_mtime)
+
+
+def backup_files(files: list[Path], settings: Settings) -> tuple[Path, BackupResult]:
     """ファイルをバックアップ先へコピーする。"""
-    # 実行ごとに保存先が分かるよう、日時付きフォルダを作る
-    backup_root = dest / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    copied = 0
+    backup_root = settings.dest / dt.datetime.now().strftime(TIMESTAMP_FMT)
+    result = BackupResult(scanned=len(files))
 
     for file in files:
-        # 元フォルダからの相対パスを維持して保存
-        relative = file.relative_to(source)
-        target = backup_root / relative
-        print(f"[COPY] {file} -> {target}")
+        rel = file.relative_to(settings.source)
+        target = backup_root / rel
 
-        if not dry_run:
+        if is_same_file(file, target):
+            print(f"[SKIP] 変更なし: {file}")
+            result.skipped += 1
+            continue
+
+        print(f"[COPY] {file} -> {target}")
+        if not settings.dry_run:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(file, target)
-        copied += 1
 
-    print(f"\n完了: {copied} 件 {'(dry-run)' if dry_run else ''}")
-    if not dry_run:
+        result.copied += 1
+
+    if not settings.dry_run:
         print(f"保存先: {backup_root}")
-    return copied
+    return backup_root, result
+
+
+def apply_retention(dest: Path, keep: int, dry_run: bool) -> int:
+    """古いバックアップ世代を削除して、keep件だけ残す。"""
+    backup_dirs = [p for p in dest.iterdir() if p.is_dir()]
+
+    # タイムスタンプ名のフォルダだけを対象にする
+    valid_backups: list[Path] = []
+    for p in backup_dirs:
+        try:
+            dt.datetime.strptime(p.name, TIMESTAMP_FMT)
+        except ValueError:
+            continue
+        valid_backups.append(p)
+
+    valid_backups.sort(key=lambda x: x.name, reverse=True)
+    to_delete = valid_backups[keep:]
+
+    for old in to_delete:
+        print(f"[PRUNE] 古いバックアップを削除: {old}")
+        if not dry_run:
+            shutil.rmtree(old)
+
+    return len(to_delete)
+
+
+def print_summary(result: BackupResult, pruned: int, dry_run: bool) -> None:
+    """実行結果を見やすく表示する。"""
+    mode = "DRY-RUN" if dry_run else "EXECUTE"
+    print("\n===== 結果サマリー =====")
+    print(f"モード: {mode}")
+    print(f"探索対象: {result.scanned} 件")
+    print(f"コピー実行: {result.copied} 件")
+    print(f"スキップ: {result.skipped} 件")
+    print(f"世代削除: {pruned} 件")
 
 
 def main() -> None:
     """メイン処理。"""
     args = parse_args()
-    source, dest, ext = resolve_settings(args)
+    settings = resolve_settings(args)
 
-    if not source.exists() or not source.is_dir():
-        raise FileNotFoundError(f"source が存在しないか、フォルダではありません: {source}")
+    if not settings.source.exists() or not settings.source.is_dir():
+        raise FileNotFoundError(f"source が存在しないか、フォルダではありません: {settings.source}")
 
-    files = collect_files(source, [e.lower() for e in ext])
+    if not settings.dest.exists() and not settings.dry_run:
+        settings.dest.mkdir(parents=True, exist_ok=True)
+
+    files = collect_files(settings)
     if not files:
         print("対象ファイルが見つかりませんでした")
         return
 
-    backup_files(files, source, dest, args.dry_run)
+    _, result = backup_files(files, settings)
+    pruned = apply_retention(settings.dest, settings.keep, settings.dry_run) if settings.dest.exists() else 0
+    print_summary(result, pruned, settings.dry_run)
 
 
 if __name__ == "__main__":
