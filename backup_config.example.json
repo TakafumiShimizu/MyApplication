@@ -1,0 +1,5 @@
+{
+  "source": "./data",
+  "dest": "./backup",
+  "ext": [".txt", ".csv", ".log"]
+}
