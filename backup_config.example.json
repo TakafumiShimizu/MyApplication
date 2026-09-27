@@ -1,0 +1,7 @@
+{
+  "source": "./data",
+  "dest": "./backup",
+  "ext": [".txt", ".csv", ".log"],
+  "exclude": ["*.tmp", "cache/*"],
+  "keep": 7
+}
